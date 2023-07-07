@@ -6,7 +6,6 @@
 
 #include "pcg.h"
 
-//示例
 typedef struct{
 	double *p;
 	double *z;
@@ -15,9 +14,25 @@ typedef struct{
 } Para;
 extern "C" void slave_example(Para *para);
 
+typedef struct{
+	struct CsrMatrix csr_matrix;
+	double* vec;
+	double* result;
+	double* val;
+} spmvPara;
+extern "C" void slave_spmv(spmvPara *para);
+extern "C" void slave_pre_spmv(spmvPara *para);
+int cells;
+
 PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int maxIter, double tolerance, double normfactor) {
+    static int isInit = 0;
+	if(isInit == 0){
+		CRTS_init();
+		isInit = 1;
+	}
+
     int iter = 0;
-    int cells = ldu_matrix.cells;
+    cells = ldu_matrix.cells;
     int faces = ldu_matrix.faces;
 
     PCG pcg;
@@ -66,29 +81,20 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
                 // p = z + beta * p				 
                 pcg.beta = pcg.sumprod / pcg.sumprod_old;
 				
-                //未优化代码段
                 /*for(int i = 0; i < cells; i++) {
                     pcg.p[i] = pcg.z[i] + pcg.beta * pcg.p[i];
                 }*/
 				
-				// == 优化示例代码段 ==
-				static int isInit = 0;
-				if(isInit == 0){
-					//从核初始化
-					CRTS_init();
-					isInit = 1;
-				}
-				//参数定义并赋值
 				Para para;
 				para.p = pcg.p;
 				para.z = pcg.z;
 				para.beta = pcg.beta;
 				para.cells = cells;
-				//启动从核
+
 				athread_spawn(slave_example, &para);
-				//等待从核线程组终止
+
 				athread_join();
-				// == 优化示例代码段 ==
+
             }
 
             // Ax = A * p			 
@@ -176,7 +182,7 @@ void ldu_to_csr(const LduMatrix &ldu_matrix, CsrMatrix &csr_matrix) {
 }
 
 void csr_spmv(const CsrMatrix &csr_matrix, double *vec, double *result) {
-    for(int i = 0; i < csr_matrix.rows; i++) {
+    /*for(int i = 0; i < csr_matrix.rows; i++) {
         int start = csr_matrix.row_off[i];
         int num = csr_matrix.row_off[i+1] - csr_matrix.row_off[i];
         double temp = 0;
@@ -184,11 +190,17 @@ void csr_spmv(const CsrMatrix &csr_matrix, double *vec, double *result) {
             temp += vec[csr_matrix.cols[start+j]] * csr_matrix.data[start+j]; 
         }
         result[i]=temp;
-    }
+    }*/
+    spmvPara para;
+    para.csr_matrix = csr_matrix;
+    para.result = result;
+    para.vec = vec;
+    athread_spawn(slave_spmv, &para);
+	athread_join();
 }
 
 void csr_precondition_spmv(const CsrMatrix &csr_matrix, double *vec, double *val, double *result) {
-    for(int i = 0; i < csr_matrix.rows; i++) {
+    /*for(int i = 0; i < csr_matrix.rows; i++) {
         int start = csr_matrix.row_off[i];
         int num = csr_matrix.row_off[i+1] - csr_matrix.row_off[i];
         double temp = 0;
@@ -196,7 +208,14 @@ void csr_precondition_spmv(const CsrMatrix &csr_matrix, double *vec, double *val
             temp += vec[csr_matrix.cols[start+j]] * val[start+j]; 
         }
         result[i]=temp;
-    }
+    }*/
+    spmvPara para;
+    para.csr_matrix = csr_matrix;
+    para.result = result;
+    para.vec = vec;
+    para.val = val;
+    athread_spawn(slave_pre_spmv, &para);
+	athread_join();
 }
 
 void v_dot_product(const int nCells, const double *vec1, const double *vec2, double *result) {
