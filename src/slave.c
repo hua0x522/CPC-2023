@@ -1,12 +1,15 @@
 #include <slave.h>
 #include "pcg_def.h"
+#include <math.h>
 
 #include <crts.h>
 
 typedef struct{
-	double *p;
-	double *z;
-	double beta;
+	double *A;
+	double *B;
+	double *C;
+	double *D;
+	double x;
 	int cells;
 } Para;
 
@@ -20,25 +23,20 @@ typedef struct{
 #define dataBufferSize 2000
 __thread_local crts_rply_t DMARply = 0;
 __thread_local unsigned int DMARplyCount = 0;
-__thread_local double p[dataBufferSize] __attribute__ ((aligned(64)));
-__thread_local double z[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local double A[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local double B[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local double C[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local double D[dataBufferSize] __attribute__ ((aligned(64)));
 
-// __thread_local double csr_val[dataBufferSize] __attribute__ ((aligned(64)));
-// __thread_local int csr_col[dataBufferSize] __attribute__ ((aligned(64)));
-// __thread_local int csr_row[dataBufferSize] __attribute__ ((aligned(64)));
-// __thread_local double vec[dataBufferSize] __attribute__ ((aligned(64)));
-// __thread_local double result[dataBufferSize] __attribute__ ((aligned(64)));
-
-void slave_example(Para* para){
+void slave_loop1(Para* para){
 	Para slavePara;
-	//接收结构体数据
+	
 	CRTS_dma_iget(&slavePara, para, sizeof(Para), &DMARply);
 	DMARplyCount++;
 	CRTS_dma_wait_value(&DMARply, DMARplyCount);
-	double beta = slavePara.beta;
+	double beta = slavePara.x;
 	int cells = slavePara.cells;
 	
-	//计算从核接收数组数据长度和接收位置
 	int len = cells / 64;
 	int rest = cells % 64;
 	int addr;
@@ -48,19 +46,183 @@ void slave_example(Para* para){
 	}else{
 		addr = CRTS_tid * len + rest;
 	}
-	//接收数组数据
-	CRTS_dma_iget(&p, slavePara.p + addr, len * sizeof(double), &DMARply);
-	CRTS_dma_iget(&z, slavePara.z + addr, len * sizeof(double), &DMARply);
+	
+	CRTS_dma_iget(&A, slavePara.A + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&B, slavePara.B + addr, len * sizeof(double), &DMARply);
 	DMARplyCount += 2;
 	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 			
-	//计算
 	int i = 0;
 	for(; i < len; i++){
-		p[i] = z[i] + beta * p[i];
+		A[i] = B[i] + beta * A[i];
 	}
-	//传回计算结果
-	CRTS_dma_iput(slavePara.p+addr, &p, len * sizeof(double), &DMARply);
+	
+	CRTS_dma_iput(slavePara.A+addr, &A, len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+}
+
+void slave_loop2(Para* para) {
+	Para slavePara;
+	
+	CRTS_dma_iget(&slavePara, para, sizeof(Para), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+
+	int cells = slavePara.cells;
+	int len = cells / 64;
+	int rest = cells % 64;
+	int addr;
+	if(CRTS_tid < rest){
+		len++;
+		addr = CRTS_tid * len;
+	}else{
+		addr = CRTS_tid * len + rest;
+	}
+	
+	CRTS_dma_iget(&A, slavePara.A + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&B, slavePara.B + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&C, slavePara.C + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&D, slavePara.D + addr, len * sizeof(double), &DMARply);
+	DMARplyCount += 4;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+			
+	int i = 0;
+	for(; i < len; i++){
+		A[i] = A[i] + slavePara.x * B[i];
+        C[i] = C[i] - slavePara.x * D[i];
+	}
+
+	CRTS_dma_iput(slavePara.A+addr, &A, len * sizeof(double), &DMARply);
+	CRTS_dma_iput(slavePara.C+addr, &C, len * sizeof(double), &DMARply);
+	DMARplyCount += 2;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+}
+
+void slave_gsumProd(Para* para) {
+	Para slavePara;
+	CRTS_dma_iget(&slavePara, para, sizeof(Para), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+
+	int cells = slavePara.cells;
+	double ret = 0;
+	int len = cells / 64;
+	int rest = cells % 64;
+	int addr;
+	if(CRTS_tid < rest){
+		len++;
+		addr = CRTS_tid * len;
+	}else{
+		addr = CRTS_tid * len + rest;
+	}
+	
+	CRTS_dma_iget(&A, slavePara.A + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&B, slavePara.B + addr, len * sizeof(double), &DMARply);
+	DMARplyCount += 2;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+			
+	int i = 0;
+	for(; i < len; i++) {
+		ret += A[i] * B[i];
+	}
+
+	slavePara.C[CRTS_tid] = ret;
+}
+
+void slave_gsumMag(Para* para) {
+	Para slavePara;
+	CRTS_dma_iget(&slavePara, para, sizeof(Para), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+
+	int cells = slavePara.cells;
+	double ret = 0;
+	int len = cells / 64;
+	int rest = cells % 64;
+	int addr;
+	if(CRTS_tid < rest){
+		len++;
+		addr = CRTS_tid * len;
+	}else{
+		addr = CRTS_tid * len + rest;
+	}
+	
+	CRTS_dma_iget(&A, slavePara.A + addr, len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+			
+	int i = 0;
+	for(; i < len; i++) {
+		ret += fabs(A[i]);
+	}
+
+	slavePara.B[CRTS_tid] = ret;
+}
+
+void slave_v_dot_product(Para* para) {
+	Para slavePara;
+	
+	CRTS_dma_iget(&slavePara, para, sizeof(Para), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+
+	int cells = slavePara.cells;
+	int len = cells / 64;
+	int rest = cells % 64;
+	int addr;
+	if(CRTS_tid < rest){
+		len++;
+		addr = CRTS_tid * len;
+	}else{
+		addr = CRTS_tid * len + rest;
+	}
+	
+	CRTS_dma_iget(&A, slavePara.A + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&B, slavePara.B + addr, len * sizeof(double), &DMARply);
+	DMARplyCount += 2;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+			
+	int i = 0;
+	for(; i < len; i++){
+		C[i] = A[i] * B[i];
+	}
+	
+	CRTS_dma_iput(slavePara.C+addr, &C, len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+}
+
+void slave_v_sub_dot_product(Para* para) {
+	Para slavePara;
+	
+	CRTS_dma_iget(&slavePara, para, sizeof(Para), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+
+	int cells = slavePara.cells;
+	int len = cells / 64;
+	int rest = cells % 64;
+	int addr;
+	if(CRTS_tid < rest){
+		len++;
+		addr = CRTS_tid * len;
+	}else{
+		addr = CRTS_tid * len + rest;
+	}
+	
+	CRTS_dma_iget(&A, slavePara.A + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&B, slavePara.B + addr, len * sizeof(double), &DMARply);
+	CRTS_dma_iget(&C, slavePara.C + addr, len * sizeof(double), &DMARply);
+	DMARplyCount += 3;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+			
+	int i = 0;
+	for(; i < len; i++){
+		D[i] = (A[i] - B[i]) * C[i];
+	}
+	
+	CRTS_dma_iput(slavePara.D+addr, &D, len * sizeof(double), &DMARply);
 	DMARplyCount++;
 	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 }

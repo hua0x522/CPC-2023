@@ -7,12 +7,19 @@
 #include "pcg.h"
 
 typedef struct{
-	double *p;
-	double *z;
-	double beta;
+	double *A;
+	double *B;
+    double *C;
+    double *D;
+	double x;
 	int cells;
 } Para;
-extern "C" void slave_example(Para *para);
+extern "C" void slave_loop1(Para *para);
+extern "C" void slave_loop2(Para *para);
+extern "C" void slave_gsumProd(Para *para);
+extern "C" void slave_gsumMag(Para *para);
+extern "C" void slave_v_dot_product(Para *para);
+extern "C" void slave_v_sub_dot_product(Para *para);
 
 typedef struct{
 	struct CsrMatrix csr_matrix;
@@ -23,6 +30,9 @@ typedef struct{
 extern "C" void slave_spmv(spmvPara *para);
 extern "C" void slave_pre_spmv(spmvPara *para);
 int cells;
+
+void loop1(PCG& pcg);
+void loop2(double* x, PCG& pcg);
 
 PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int maxIter, double tolerance, double normfactor) {
     static int isInit = 0;
@@ -81,20 +91,7 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
                 // p = z + beta * p				 
                 pcg.beta = pcg.sumprod / pcg.sumprod_old;
 				
-                /*for(int i = 0; i < cells; i++) {
-                    pcg.p[i] = pcg.z[i] + pcg.beta * pcg.p[i];
-                }*/
-				
-				Para para;
-				para.p = pcg.p;
-				para.z = pcg.z;
-				para.beta = pcg.beta;
-				para.cells = cells;
-
-				athread_spawn(slave_example, &para);
-
-				athread_join();
-
+                loop1(pcg);
             }
 
             // Ax = A * p			 
@@ -103,12 +100,7 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
             // alpha = tol_0 / tol_1 = (swap(r) * z) / ( swap(p) * A * p) 
             pcg.alpha = pcg.sumprod / pcg_gsumProd(pcg.p, pcg.Ax, cells);
 
-            // x = x + alpha * p
-            // r = r - alpha * Ax
-            for(int i = 0; i < cells; i++) {
-                x[i] = x[i] + pcg.alpha * pcg.p[i];
-                pcg.r[i] = pcg.r[i] - pcg.alpha * pcg.Ax[i];
-            }
+            loop2(x, pcg);
 
             // tol_1 = swap(z) * r				 
             pcg.residual = pcg_gsumMag(pcg.r, cells);
@@ -219,15 +211,32 @@ void csr_precondition_spmv(const CsrMatrix &csr_matrix, double *vec, double *val
 }
 
 void v_dot_product(const int nCells, const double *vec1, const double *vec2, double *result) {
-    for(int cell = 0; cell < nCells; cell++) {
-        result[cell] = vec1[cell] * vec2[cell];
-    }
+    // for(int cell = 0; cell < nCells; cell++) {
+    //     result[cell] = vec1[cell] * vec2[cell];
+    // }
+    Para para;
+	para.A = vec1;
+	para.B = vec2;
+    para.C = result;
+	para.cells = nCells;
+
+	athread_spawn(slave_v_dot_product, &para);
+	athread_join();
 }
 
 void v_sub_dot_product(const int nCells, const double *sub, const double *subed, const double *vec, double *result) {
-    for(int cell = 0; cell < nCells; cell++) {
-        result[cell] = (sub[cell] - subed[cell])*vec[cell];
-    }
+    // for(int cell = 0; cell < nCells; cell++) {
+    //     result[cell] = (sub[cell] - subed[cell])*vec[cell];
+    // }
+    Para para;
+	para.A = sub;
+	para.B = subed;
+    para.C = vec;
+    para.D = result;
+	para.cells = nCells;
+
+	athread_spawn(slave_v_sub_dot_product, &para);
+	athread_join();
 }
 
 void pcg_init_precondition_csr (const CsrMatrix &csr_matrix, Precondition &pre) {
@@ -255,19 +264,83 @@ void pcg_precondition_csr(const CsrMatrix &csr_matrix, const Precondition &pre, 
     free(gAPtr);
 }
 
+void loop1(PCG& pcg) {
+    /*for(int i = 0; i < cells; i++) {
+        pcg.p[i] = pcg.z[i] + pcg.beta * pcg.p[i];
+    }*/
+	
+	Para para;
+	para.A = pcg.p;
+	para.B = pcg.z;
+	para.x = pcg.beta;
+	para.cells = cells;
+
+	athread_spawn(slave_loop1, &para);
+	athread_join();
+}
+
+void loop2(double* x, PCG& pcg) {
+    // x = x + alpha * p
+    // r = r - alpha * Ax
+
+    /*for(int i = 0; i < cells; i++) {
+        x[i] = x[i] + pcg.alpha * pcg.p[i];
+        pcg.r[i] = pcg.r[i] - pcg.alpha * pcg.Ax[i];
+    }*/
+    Para para;
+    para.A = x;
+    para.B = pcg.p;
+    para.C = pcg.r;
+    para.D = pcg.Ax;
+    para.x = pcg.alpha;
+    para.cells = cells;
+
+    athread_spawn(slave_loop2, &para);
+	athread_join();    
+}
+
 double pcg_gsumMag(double *r, int size) {
     double ret = .0;
-    for(int i = 0; i < size; i++) {
-        ret += fabs(r[i]);
+    double temp_ret[64];
+    // for(int i = 0; i < size; i++) {
+    //     ret += fabs(r[i]);
+    // }
+
+    Para para;
+    para.A = r;
+    para.B = temp_ret;
+    para.cells = size;
+
+    athread_spawn(slave_gsumMag, &para);
+	athread_join();   
+
+    for (int i = 0; i < 64; i++) {
+        ret += temp_ret[i];
     }
+
     return ret;
 }
 
 double pcg_gsumProd(double *z, double *r, int size) {
     double ret = .0;
-    for(int i = 0; i < size; i++) {
-        ret += z[i] * r[i];
+    double temp_ret[64];
+    // for(int i = 0; i < size; i++) {
+    //     ret += z[i] * r[i];
+    // }
+
+    Para para;
+    para.A = z;
+    para.B = r;
+    para.C = temp_ret;
+    para.cells = size;
+
+    athread_spawn(slave_gsumProd, &para);
+	athread_join();   
+
+    for (int i = 0; i < 64; i++) {
+        ret += temp_ret[i];
     }
+
     return ret;
 }
 
