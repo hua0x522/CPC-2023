@@ -1,7 +1,7 @@
 #include <slave.h>
 #include "pcg_def.h"
 #include <math.h>
-#include <simd.h>
+
 #include <crts.h>
 
 typedef struct{
@@ -18,19 +18,24 @@ typedef struct{
 	double* vec;
 	double* result;
 	double* val;
+	int* row_off;
+    int* val_off;
+	int isNew;
 } spmvPara;
 
-#define dataBufferSize 2000
+#define dataBufferSize 10000
 __thread_local crts_rply_t DMARply = 0;
 __thread_local unsigned int DMARplyCount = 0;
-__thread_local double A[dataBufferSize] __attribute__ ((aligned(64)));
-__thread_local double B[dataBufferSize] __attribute__ ((aligned(64)));
-__thread_local double C[dataBufferSize] __attribute__ ((aligned(64)));
-__thread_local double D[dataBufferSize] __attribute__ ((aligned(64)));
 
-__thread_local double csr_data[dataBufferSize / 10] __attribute__ ((aligned(64)));
-__thread_local int csr_col[dataBufferSize / 10] __attribute__ ((aligned(64)));
-__thread_local int csr_row[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local double csr_val[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local int csr_col[dataBufferSize] __attribute__ ((aligned(64)));
+__thread_local int csr_row[dataBufferSize / 5] __attribute__ ((aligned(64)));
+__thread_local double result[dataBufferSize / 5] __attribute__ ((aligned(64)));
+
+__thread_local double A[dataBufferSize / 5] __attribute__ ((aligned(64)));
+__thread_local double B[dataBufferSize / 5] __attribute__ ((aligned(64)));
+__thread_local double C[dataBufferSize / 5] __attribute__ ((aligned(64)));
+__thread_local double D[dataBufferSize / 5] __attribute__ ((aligned(64)));
 
 void slave_loop1(Para* para){
 	Para slavePara;
@@ -188,15 +193,7 @@ void slave_v_dot_product(Para* para) {
 	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 			
 	int i = 0;
-	int _len = len / 8 * 8;
-	doublev8 va, vb, vc;
-	for(; i < _len; i += 8){
-		simd_load(va, A+i);
-		simd_load(vb, B+i);
-		vc = va * vb;
-		simd_store(vc, C+i);
-	}
-	for (; i < len; i++) {
+	for(; i < len; i++){
 		C[i] = A[i] * B[i];
 	}
 	
@@ -230,16 +227,7 @@ void slave_v_sub_dot_product(Para* para) {
 	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 			
 	int i = 0;
-	int _len = len / 8 * 8;
-	doublev8 va, vb, vc, vd;
-	for(; i < _len; i += 8){
-		simd_load(va, A+i);
-		simd_load(vb, B+i);
-		simd_load(vc, C+i);
-		vd = (va - vb) * vc;
-		simd_store(vd, D+i);
-	}
-	for (; i < len; i++) {
+	for(; i < len; i++){
 		D[i] = (A[i] - B[i]) * C[i];
 	}
 	
@@ -257,27 +245,36 @@ void slave_spmv(spmvPara* para) {
 
 	struct CsrMatrix csr_matrix = slavePara.csr_matrix;
 	double* vec = slavePara.vec; 
-	double* result = slavePara.result;
 
-	int row_len = csr_matrix.rows / 64;
-	int rest = csr_matrix.rows % 64;
-	int row_off;
-	if (CRTS_tid < rest) {
-		row_len++;
-		row_off = CRTS_tid * row_len;
-	} else {
-		row_off = CRTS_tid * row_len + rest;
+	int row_off = slavePara.row_off[CRTS_tid];
+	int row_len = slavePara.row_off[CRTS_tid+1] - row_off;
+	int val_off = slavePara.val_off[CRTS_tid];
+	int val_len = slavePara.val_off[CRTS_tid+1] - val_off;
+
+	if (slavePara.isNew) {
+		CRTS_dma_iget(&csr_row, csr_matrix.row_off + row_off, (row_len+1) * sizeof(int), &DMARply);
+		CRTS_dma_iget(&csr_col, csr_matrix.cols + val_off, val_len * sizeof(int), &DMARply);
+		DMARplyCount += 2;
+		CRTS_dma_wait_value(&DMARply, DMARplyCount);
 	}
+	
+	CRTS_dma_iget(&csr_val, csr_matrix.data + val_off, val_len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 
-	for(int i = row_off; i < row_off + row_len; i++) {
-        int start = csr_matrix.row_off[i];
-        int num = csr_matrix.row_off[i+1] - csr_matrix.row_off[i];
+	for(int i = 0; i < row_len; i++) {
+		int start = csr_row[i];
+        int num = csr_row[i+1] - csr_row[i];
         double temp = 0;
         for(int j = 0; j < num; j++) {                      
-            temp += vec[csr_matrix.cols[start+j]] * csr_matrix.data[start+j]; 
+            temp += vec[csr_col[start+j-val_off]] * csr_val[start+j-val_off]; 
         }
         result[i]=temp;
     }
+
+	CRTS_dma_iput(slavePara.result+row_off, &result, row_len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 }
 
 void slave_pre_spmv(spmvPara* para) {
@@ -289,26 +286,34 @@ void slave_pre_spmv(spmvPara* para) {
 
 	struct CsrMatrix csr_matrix = slavePara.csr_matrix;
 	double* vec = slavePara.vec; 
-	double* result = slavePara.result;
-	double* val = slavePara.val;
 
-	int row_len = csr_matrix.rows / 64;
-	int rest = csr_matrix.rows % 64;
-	int row_off;
-	if (CRTS_tid < rest) {
-		row_len++;
-		row_off = CRTS_tid * row_len;
-	} else {
-		row_off = CRTS_tid * row_len + rest;
+	int row_off = slavePara.row_off[CRTS_tid];
+	int row_len = slavePara.row_off[CRTS_tid+1] - row_off;
+	int val_off = slavePara.val_off[CRTS_tid];
+	int val_len = slavePara.val_off[CRTS_tid+1] - val_off;
+
+	if (slavePara.isNew) {
+		CRTS_dma_iget(&csr_row, csr_matrix.row_off + row_off, (row_len+1) * sizeof(int), &DMARply);
+		CRTS_dma_iget(&csr_col, csr_matrix.cols + val_off, val_len * sizeof(int), &DMARply);
+		DMARplyCount += 2;
+		CRTS_dma_wait_value(&DMARply, DMARplyCount);
 	}
+	
+	CRTS_dma_iget(&csr_val, slavePara.val + val_off, val_len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 
-	for(int i = row_off; i < row_off + row_len; i++) {
-        int start = csr_matrix.row_off[i];
-        int num = csr_matrix.row_off[i+1] - csr_matrix.row_off[i];
+	for(int i = 0; i < row_len; i++) {
+		int start = csr_row[i];
+        int num = csr_row[i+1] - csr_row[i];
         double temp = 0;
         for(int j = 0; j < num; j++) {                      
-            temp += vec[csr_matrix.cols[start+j]] * val[start+j]; 
+            temp += vec[csr_col[start+j-val_off]] * csr_val[start+j-val_off]; 
         }
         result[i]=temp;
     }
+
+	CRTS_dma_iput(slavePara.result+row_off, &result, row_len * sizeof(double), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 }

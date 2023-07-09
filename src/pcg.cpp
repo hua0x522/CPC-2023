@@ -3,7 +3,6 @@
 #include <string.h>
 #include <math.h>
 #include <crts.h>
-#include<sys/time.h>
 #include "pcg.h"
 
 typedef struct{
@@ -26,15 +25,21 @@ typedef struct{
 	double* vec;
 	double* result;
 	double* val;
+    int* row_off;
+    int* val_off;
+    int isNew;
 } spmvPara;
 extern "C" void slave_spmv(spmvPara *para);
 extern "C" void slave_pre_spmv(spmvPara *para);
 int cells;
-struct timeval tv;
-double spmv_time;
+int row_off[65];
+int val_off[65];
+double* gAPtr;
+int isNew;
 
 void loop1(PCG& pcg);
 void loop2(double* x, PCG& pcg);
+void csr_div_thread(const CsrMatrix &csr_matrix);
 
 PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int maxIter, double tolerance, double normfactor) {
     static int isInit = 0;
@@ -46,6 +51,7 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
     int iter = 0;
     cells = ldu_matrix.cells;
     int faces = ldu_matrix.faces;
+    isNew = 1;
 
     PCG pcg;
     pcg.r = (double *)malloc(cells*sizeof(double));
@@ -64,8 +70,11 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
 
     pcg_init_precondition_csr(csr_matrix, pre);
 
+    csr_div_thread(csr_matrix);
+
     // AX = A * X	 
     csr_spmv(csr_matrix, x, pcg.Ax);
+    isNew = 0;
     // r = b - A * x
     for(int i = 0; i < cells; i++) {
         pcg.r[i] = source[i] - pcg.Ax[i];
@@ -73,7 +82,9 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
 	
     pcg.residual = pcg_gsumMag(pcg.r, cells);
     double init_residual = pcg.residual;
-	
+
+    gAPtr = (double*)malloc(csr_matrix.rows*sizeof(double));
+    
     if(fabs(pcg.residual / normfactor) > tolerance ) {
         do {
             if(iter == 0) {
@@ -108,9 +119,10 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
             pcg.residual = pcg_gsumMag(pcg.r, cells);
         } while( ++iter < maxIter  && (pcg.residual/normfactor) >= tolerance);
     }
+
+    free(gAPtr);
     
     INFO("PCG: init residual = %e, final residual = %e, iterations: %d\n", init_residual, pcg.residual, iter);
-    INFO("spmv time: %lf\n", spmv_time);
     free_pcg(pcg);
     free_csr_matrix(csr_matrix);
     free_precondition(pre);
@@ -119,6 +131,27 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
     pcg_return.residual = pcg.residual;
     pcg_return.iter = iter;
     return pcg_return;
+}
+
+void csr_div_thread(const CsrMatrix &csr_matrix) {
+    for (int i = 0; i <= 64; i++) {
+        row_off[i] = 0;
+        val_off[i] = 0;
+    }
+    int size = csr_matrix.data_size / 64 + 1;
+    int cnt = 0;
+    for (int i = 1; i <= csr_matrix.rows; i++) {
+        if (csr_matrix.row_off[i] - val_off[cnt] >= size) {
+            cnt++;
+            val_off[cnt] = csr_matrix.row_off[i];
+            row_off[cnt] = i;
+        }
+    }
+    while (cnt < 64) {
+        cnt++;
+        val_off[cnt] = csr_matrix.data_size;
+        row_off[cnt] = csr_matrix.rows;
+    }
 }
 
 void ldu_to_csr(const LduMatrix &ldu_matrix, CsrMatrix &csr_matrix) {
@@ -185,17 +218,15 @@ void csr_spmv(const CsrMatrix &csr_matrix, double *vec, double *result) {
         }
         result[i]=temp;
     }*/
-    gettimeofday(&tv,NULL);
-	double pcg_start = (double)(tv.tv_sec)+(double)(tv.tv_usec)*1e-6;
     spmvPara para;
     para.csr_matrix = csr_matrix;
     para.result = result;
     para.vec = vec;
+    para.val_off = val_off;
+    para.row_off = row_off;
+    para.isNew = isNew;
     athread_spawn(slave_spmv, &para);
 	athread_join();
-    gettimeofday(&tv,NULL);
-	double pcg_end = (double)(tv.tv_sec)+(double)(tv.tv_usec)*1e-6;
-    spmv_time += pcg_end - pcg_start;
 }
 
 void csr_precondition_spmv(const CsrMatrix &csr_matrix, double *vec, double *val, double *result) {
@@ -213,6 +244,9 @@ void csr_precondition_spmv(const CsrMatrix &csr_matrix, double *vec, double *val
     para.result = result;
     para.vec = vec;
     para.val = val;
+    para.row_off = row_off;
+    para.val_off = val_off;
+    para.isNew = isNew; 
     athread_spawn(slave_pre_spmv, &para);
 	athread_join();
 }
@@ -260,15 +294,9 @@ void pcg_init_precondition_csr (const CsrMatrix &csr_matrix, Precondition &pre) 
 }
 
 void pcg_precondition_csr(const CsrMatrix &csr_matrix, const Precondition &pre, double *rAPtr, double *wAPtr) {
-    double* gAPtr = (double*)malloc(csr_matrix.rows*sizeof(double));
     v_dot_product(csr_matrix.rows, pre.preD, rAPtr, wAPtr);
-    memset(gAPtr, 0, csr_matrix.rows*sizeof(double));
-    for(int deg = 1; deg < 2; deg++) {   
-        csr_precondition_spmv(csr_matrix, wAPtr, pre.pre_mat_val, gAPtr);
-        v_sub_dot_product(csr_matrix.rows, rAPtr, gAPtr, pre.preD, wAPtr);
-        memset(gAPtr, 0, csr_matrix.rows*sizeof(double));
-    }
-    free(gAPtr);
+    csr_precondition_spmv(csr_matrix, wAPtr, pre.pre_mat_val, gAPtr);
+    v_sub_dot_product(csr_matrix.rows, rAPtr, gAPtr, pre.preD, wAPtr);
 }
 
 void loop1(PCG& pcg) {
