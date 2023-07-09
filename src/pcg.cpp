@@ -3,7 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <crts.h>
-
+#include<sys/time.h>
 #include "pcg.h"
 
 typedef struct{
@@ -30,6 +30,8 @@ typedef struct{
 extern "C" void slave_spmv(spmvPara *para);
 extern "C" void slave_pre_spmv(spmvPara *para);
 int cells;
+struct timeval tv;
+double spmv_time;
 
 void loop1(PCG& pcg);
 void loop2(double* x, PCG& pcg);
@@ -108,7 +110,7 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
     }
     
     INFO("PCG: init residual = %e, final residual = %e, iterations: %d\n", init_residual, pcg.residual, iter);
-    
+    INFO("spmv time: %lf\n", spmv_time);
     free_pcg(pcg);
     free_csr_matrix(csr_matrix);
     free_precondition(pre);
@@ -183,12 +185,17 @@ void csr_spmv(const CsrMatrix &csr_matrix, double *vec, double *result) {
         }
         result[i]=temp;
     }*/
+    gettimeofday(&tv,NULL);
+	double pcg_start = (double)(tv.tv_sec)+(double)(tv.tv_usec)*1e-6;
     spmvPara para;
     para.csr_matrix = csr_matrix;
     para.result = result;
     para.vec = vec;
     athread_spawn(slave_spmv, &para);
 	athread_join();
+    gettimeofday(&tv,NULL);
+	double pcg_end = (double)(tv.tv_sec)+(double)(tv.tv_usec)*1e-6;
+    spmv_time += pcg_end - pcg_start;
 }
 
 void csr_precondition_spmv(const CsrMatrix &csr_matrix, double *vec, double *val, double *result) {
