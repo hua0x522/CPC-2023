@@ -317,3 +317,28 @@ void slave_pre_spmv(spmvPara* para) {
 	DMARplyCount++;
 	CRTS_dma_wait_value(&DMARply, DMARplyCount);
 }
+
+void slave_pcg_init_precondition_csr(spmvPara* para) {
+	spmvPara slavePara;
+
+	CRTS_dma_iget(&slavePara, para, sizeof(spmvPara), &DMARply);
+	DMARplyCount++;
+	CRTS_dma_wait_value(&DMARply, DMARplyCount);
+
+	struct CsrMatrix csr_matrix = slavePara.csr_matrix;
+	int row_off = slavePara.row_off[CRTS_tid];
+	int row_len = slavePara.row_off[CRTS_tid+1] - row_off;
+	double* preD = slavePara.val;
+	double* pre_mat_val = slavePara.result;
+
+	for(int i = row_off ; i < row_off + row_len; i++) {
+        for(int j = csr_matrix.row_off[i]; j < csr_matrix.row_off[i+1]; j++){
+            if(csr_matrix.cols[j] == i) {
+                pre.pre_mat_val[j] = 0.;	 
+                preD[i] = 1.0/csr_matrix.data[j];
+            } else {
+                pre_mat_val[j] = csr_matrix.data[j];
+            }
+        }
+    }
+}

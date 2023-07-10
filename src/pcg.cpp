@@ -31,11 +31,15 @@ typedef struct{
 } spmvPara;
 extern "C" void slave_spmv(spmvPara *para);
 extern "C" void slave_pre_spmv(spmvPara *para);
+extern "C" void slave_pcg_init_precondition_csr(spmvPara *para);
+
 int cells;
 int row_off[65];
 int val_off[65];
 double* gAPtr;
 int isNew;
+int newM;
+CsrMatrix csr_matrix;
 
 void loop1(PCG& pcg);
 void loop2(double* x, PCG& pcg);
@@ -47,6 +51,8 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
 		CRTS_init();
 		isInit = 1;
 	}
+
+    newM = (cells != ldu_matrix.cells);
 
     int iter = 0;
     cells = ldu_matrix.cells;
@@ -65,12 +71,13 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
     pre.preD = (double *)malloc(cells*sizeof(double));
     pre.pre_mat_val = (double *)malloc((cells + faces*2)*sizeof(double));
 
-    CsrMatrix csr_matrix;
-    ldu_to_csr(ldu_matrix, csr_matrix); 
-
-    pcg_init_precondition_csr(csr_matrix, pre);
+    if (newM) {
+        free_csr_matrix(csr_matrix);
+        ldu_to_csr(ldu_matrix, csr_matrix); 
+    }
 
     csr_div_thread(csr_matrix);
+    pcg_init_precondition_csr(csr_matrix, pre);
 
     // AX = A * X	 
     csr_spmv(csr_matrix, x, pcg.Ax);
@@ -124,7 +131,6 @@ PCGReturn pcg_solve(const LduMatrix &ldu_matrix, double *source, double *x, int 
     
     INFO("PCG: init residual = %e, final residual = %e, iterations: %d\n", init_residual, pcg.residual, iter);
     free_pcg(pcg);
-    free_csr_matrix(csr_matrix);
     free_precondition(pre);
 
     PCGReturn pcg_return;
@@ -281,16 +287,25 @@ void v_sub_dot_product(const int nCells, const double *sub, const double *subed,
 }
 
 void pcg_init_precondition_csr (const CsrMatrix &csr_matrix, Precondition &pre) {
-    for(int i = 0 ; i < csr_matrix.rows; i++) {
-        for(int j = csr_matrix.row_off[i]; j < csr_matrix.row_off[i+1]; j++){
-            if(csr_matrix.cols[j] == i) {
-                pre.pre_mat_val[j] = 0.;	 
-                pre.preD[i] = 1.0/csr_matrix.data[j];
-            } else {
-                pre.pre_mat_val[j] = csr_matrix.data[j];
-            }
-        }
-    }
+    // for(int i = 0 ; i < csr_matrix.rows; i++) {
+    //     for(int j = csr_matrix.row_off[i]; j < csr_matrix.row_off[i+1]; j++){
+    //         if(csr_matrix.cols[j] == i) {
+    //             pre.pre_mat_val[j] = 0.;	 
+    //             pre.preD[i] = 1.0/csr_matrix.data[j];
+    //         } else {
+    //             pre.pre_mat_val[j] = csr_matrix.data[j];
+    //         }
+    //     }
+    // }
+    spmvPara para;
+    para.csr_matrix = csr_matrix;
+    para.result = pre.pre_mat_val;
+    para.val = pre.preD;
+    para.row_off = row_off;
+    para.val_off = val_off;
+    
+    athread_spawn(slave_pcg_init_precondition_csr, &para);
+	athread_join();
 }
 
 void pcg_precondition_csr(const CsrMatrix &csr_matrix, const Precondition &pre, double *rAPtr, double *wAPtr) {
